@@ -16,7 +16,7 @@ from SAP.src.model import PSR2Mesh
 from collections import defaultdict
 from SAP.src.model import Encode2Points
 from SAP.src.utils import *
-
+import open3d as o3d
 
 def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
     print('Training Start.......')
@@ -92,7 +92,7 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
         print("epoch:", epoch)
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        base_model.train()
+        # base_model.train()
 
         epoch_start_time = time.time()
         batch_start_time = time.time()
@@ -124,16 +124,17 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
             w_psr = 1
 
             torch.autograd.set_detect_anomaly(True)
-            psr_grid, point_r = base_model(partial,min_gt,max_gt,value_std_pc,value_centroid)
-            print('psr_grid-train', psr_grid)
-            print('point_r-train', point_r)
+            psr_grid, point_r = base_model(partial, min_gt, max_gt, value_std_pc, value_centroid)
+            # print('psr_grid-train', psr_grid)
+            # print('point_r-train', point_r)
             psr_grid = torch.tanh(psr_grid)
             gt_psr = torch.tanh(gt_psr)
             # loss_each = {}
             #
             # print('point r point',point_r.shape)
             # print('ground truth shape',gt.shape)
-            loss_chamfer = base_model.module.get_loss(point_r, gt)
+            # loss_chamfer = base_model.module.get_loss(point_r, gt)
+            loss_chamfer = ChamferDisL2(point_r, gt)
             # loss_chamfer, _ = chamfer_distance(point_r, gt)
 
             loss_mse = criterion(psr_grid, gt_psr)
@@ -147,13 +148,22 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
                 num_iter = 0
                 optimizer.step()
                 base_model.zero_grad()
-            logger.info('loss metric : %.4f' % (loss))
+            # logger.info('loss metric : %.4f' % (loss))
+            
             n_itr = epoch * n_batches + idx
             if train_writer is not None:
                 train_writer.add_scalar('train/itr', loss, n_itr)
 
             batch_time.update(time.time() - batch_start_time)
             batch_start_time = time.time()
+
+            if idx % 10 == 0:
+                logger.info(
+                    f'[Epoch {epoch}/{config.max_epoch}][Batch {idx + 1}/{n_batches}] '
+                    f'BatchTime = {batch_time.val:.3f} (s) DataTime = {data_time.val:.3f} (s) '
+                    f'loss_chamferl2 = {loss_chamfer.item():.4f} loss_mse = {loss_mse.item():.4f} '
+                    f'lr = {optimizer.param_groups[0]["lr"]:.6f}'
+                )
 
         if loss_each is not None:
             # print_log((' loss_%s=%.4f') % (k, l.item()),logger = logger)
@@ -168,7 +178,7 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
 
         if epoch % args.val_freq == 0 and epoch != 0:
             # Validate the current model
-            metrics = validate(base_model, criterion, test_dataloader, epoch, val_writer, args, config, config_SAP,
+            metrics = validate(base_model, ChamferDisL2, criterion, test_dataloader, epoch, val_writer, args, config, config_SAP,
                                logger=logger)
 
             # Save ckeckpoints
@@ -186,7 +196,7 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
     val_writer.close()
 
 
-def validate(base_model, criterion, test_dataloader, epoch, val_writer, args, config, config_SAP, logger=None):
+def validate(base_model, ChamferDisL2, criterion, test_dataloader, epoch, val_writer, args, config, config_SAP, logger=None):
     print_log(f"[VALIDATION] Start validating epoch {epoch}", logger=logger)
     base_model.eval()  # set model to eval mode
     eval_list = defaultdict(list)
@@ -210,27 +220,28 @@ def validate(base_model, criterion, test_dataloader, epoch, val_writer, args, co
                 raise NotImplementedError(f'Train phase do not support {dataset_name}')
 
             psr_grid, point_r = base_model(partial,min_gt,max_gt,value_std_pc,value_centroid)
-            print('psr_grid_valid', psr_grid)
-            print('point_r_valid', point_r)
+            # print('psr_grid_valid', psr_grid)
+            # print('point_r_valid', point_r)
 
             psr_grid = torch.tanh(psr_grid)
             gt_psr = torch.tanh(gt_psr)
-            loss_chamfer = base_model.module.get_loss(point_r, gt)
+            # loss_chamfer = base_model.module.get_loss(point_r, gt)
+            loss_chamfer = ChamferDisL2(point_r, gt)
             # loss_chamfer, _ = chamfer_distance(point_r, gt)
 
             loss_mse = criterion(psr_grid, gt_psr)
             loss = loss_mse + loss_chamfer
             eval_step_dict['psr_l1'] = loss_chamfer.cpu()
             eval_step_dict['psr_l2'] = loss_mse.cpu()
-            print(loss_chamfer.cpu())
-            print(loss_mse.cpu())
+            # print(loss_chamfer.cpu())
+            # print(loss_mse.cpu())
             for k, v in eval_step_dict.items():
                 eval_list[k].append(v)
 
             eval_dict = {k: np.mean(v) for k, v in eval_list.items()}
 
             metric_val = eval_dict['psr_l2']
-            logger.info('Validation metric : %.4f' % (metric_val))
+            logger.info('Validation metric ChamferDisL2 : %.4f，psr_mse : %.4f' % (eval_dict['psr_l1'], eval_dict['psr_l2']))
 
             if val_writer is not None:
                 val_writer.add_scalar('Valid/epoch', loss, epoch)
@@ -261,7 +272,7 @@ def test_net(args, config):
     test(base_model, test_dataloader,ChamferDisL1,ChamferDisL2, args, config, logger=logger)
 
 
-def test(base_model, test_dataloader,ChamferDisL1,ChamferDisL2, args, config, logger=None):
+def test(base_model, test_dataloader, ChamferDisL1, ChamferDisL2, args, config, logger=None):
     base_model.eval()  # set model to eval mode
     # use_cuda = not args.no_cuda and torch.cuda.is_available()
     # device = torch.device("cuda" if use_cuda else "cpu")
@@ -296,17 +307,23 @@ def test(base_model, test_dataloader,ChamferDisL1,ChamferDisL2, args, config, lo
                 min_gt = torch.from_numpy(np.asarray(min_gt)).float()
                 max_gt = torch.from_numpy(np.asarray(max_gt)).float()
                 #calculate mian and max
-                psr_grid,points,point_r,min_depoint,max_depoint = base_model(partial, min_gt.cuda(), max_gt.cuda(), value_std_pc.cuda(), value_centroid.cuda())
+                # psr_grid, points, point_r, min_depoint, max_depoint = base_model(partial, min_gt.cuda(), max_gt.cuda(), value_std_pc.cuda(), value_centroid.cuda())
+                psr_grid, point_r = base_model(partial, min_gt.cuda(), max_gt.cuda(), value_std_pc.cuda(), value_centroid.cuda())
                 point_dir = "./Results-pointr"
                 dense_points = point_r
-                dense_points = torch.multiply(dense_points[0].cpu(), value_std_pc) + value_centroid
-                np.save(os.path.join(point_dir, str(model_id) + 'pred.npy'), dense_points.cpu().numpy())
+                # dense_points = torch.multiply(dense_points[0].cpu(), value_std_pc) + value_centroid
+                # np.save(os.path.join(point_dir, str(model_id) + 'pred.npy'), dense_points.cpu().numpy())
+                # 用o3d保存为.ply文件
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(dense_points[0].cpu().numpy())
+                o3d.io.write_point_cloud(os.path.join(point_dir, str(model_id) + 'pred.ply'), pcd)
 
                 min_gt = dense_points.min()
                 max_gt = dense_points.max()
                 #min_gt = torch.from_numpy(np.asarray(min_gt)).float()
                 #max_gt = torch.from_numpy(np.asarray(max_gt)).float()
                 #now calculate mesh crown
+                '''
                 psr_grid, points, point_r, min_depoint, max_depoint = base_model(partial, min_gt.cuda(), max_gt.cuda(), value_std_pc.cuda(),value_centroid.cuda())
                 v, f, _ = mc_from_psr(psr_grid, zero_level=threshold)
                 min_depoint = min_depoint.cpu().numpy()
@@ -327,6 +344,7 @@ def test(base_model, test_dataloader,ChamferDisL1,ChamferDisL2, args, config, lo
 
 
                 np.save(os.path.join(point_dir, str(model_id) + 'predsap.npy'), de_point)
+                '''
                 loss_chamfer_l1 = ChamferDisL1(point_r, gt)
                 loss_chamfer_l2 = ChamferDisL2(point_r, gt)
                 #loss_chamfer = base_model.get_loss(point_r, gt)
@@ -347,9 +365,4 @@ def test(base_model, test_dataloader,ChamferDisL1,ChamferDisL2, args, config, lo
                 continue
             else:
                 raise NotImplementedError(f'Train phase do not support {dataset_name}')
-
-            if (idx + 1) % 2 == 0:
-                print_log('Test[%d/%d] Taxonomy = %s Sample = %s Losses = %s' %
-                          (idx + 1, n_samples, taxonomy_id, model_id, ['%.4f' % l for k, v in eval_dict.items()],
-                           ), logger=logger)
     return
