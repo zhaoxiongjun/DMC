@@ -11,6 +11,7 @@ import argparse
 from SAP.src import utils
 from SAP.src.model import Encode2Points
 from SAP.src.model import PSR2Mesh
+
 def fps(pc, num,device):
     pc = pc.to(device)
     fps_idx = pointnet2_utils.furthest_point_sample(pc, num) 
@@ -68,14 +69,14 @@ class PoinTr(nn.Module):
         super().__init__()
         self.trans_dim = config.trans_dim
         self.knn_layer = config.knn_layer
-        self.num_pred = config.num_pred
-        self.num_query = config.num_query
+        self.num_pred = config.num_pred  # 1568
+        self.num_query = config.num_query  # 96 
         self.model_sap = Encode2Points("SAP/configs/learning_based/noise_small/ours.yaml")
         self.psr2mesh = PSR2Mesh.apply
         self.fold_step = int(pow(self.num_pred//self.num_query, 0.5) + 0.5)
         self.base_model = PCTransformer(in_chans = 3, embed_dim = self.trans_dim, depth = [6, 8], drop_rate = 0., num_query = self.num_query, knn_layer = self.knn_layer)
         self.foldingnet = Fold(self.trans_dim, step = self.fold_step, hidden_dim = 256)  # rebuild a cluster point
-        self.dpsr = DPSR(res=(128,128,  128), sig = 2)
+        self.dpsr = DPSR(res=(128, 128, 128), sig = 2)
 
 
 
@@ -97,7 +98,7 @@ class PoinTr(nn.Module):
         return loss_fine
 
 
-    def forward(self,xyz,min_gt,max_gt,value_std_pc,value_centroid):
+    def forward(self, xyz, min_gt, max_gt, value_std_pc, value_centroid):
 
 
         q, coarse_point_cloud = self.base_model(xyz) # B M C and B M 3
@@ -120,22 +121,26 @@ class PoinTr(nn.Module):
         relative_xyz = self.foldingnet(rebuild_feature).reshape(B, M, 3, -1)    # B M 3 S
         #print(relative_xyz.shape)
         rebuild_points = (relative_xyz + coarse_point_cloud.unsqueeze(-1)).transpose(2,3).reshape(B, -1, 3)  # B N 3
-        ##print(rebuild_points.shape)
+        # print(rebuild_points.shape)
 
 
         # cat the input
         #inp_sparse = fps(xyz, self.num_query)
 
         # denormalize the data based on mean and std
-        value_std_points=value_std_pc.view((rebuild_points.shape[0],1,3))
-        value_centroid_points=value_centroid.view((rebuild_points.shape[0],1,3))
-        De_point = torch.multiply(rebuild_points, value_std_points) + value_centroid_points
+        # value_std_points=value_std_pc.view((rebuild_points.shape[0],1,3))
+        # value_centroid_points=value_centroid.view((rebuild_points.shape[0],1,3))
+        # De_point = torch.multiply(rebuild_points, value_std_points) + value_centroid_points
+        value_centroid_points = value_centroid.view((rebuild_points.shape[0], 1, 3))
+        max_distance = value_std_pc.view((rebuild_points.shape[0], 1, 1))  # Ensure shape compatibility
+        De_point = rebuild_points * max_distance + value_centroid_points
 
         #Normalize data to min and max on gt
-        min_depoint=min_gt.view(rebuild_points.shape[0],1,1)
+        min_depoint = min_gt.view(rebuild_points.shape[0],1,1)
         max_depoint = max_gt.view(rebuild_points.shape[0],1,1)
 
-        Npoints = torch.div(torch.subtract(De_point,min_depoint),torch.subtract((max_depoint + 1),min_depoint))
+        Npoints = torch.div(torch.subtract(De_point, min_depoint), torch.subtract((max_depoint + 1), min_depoint))
+        # Npoints = (De_point - min_depoint) / (max_depoint - min_depoint + 1e-8)
 
         #SAP
         out = self.model_sap(Npoints)
@@ -143,5 +148,5 @@ class PoinTr(nn.Module):
         psr_grid= self.dpsr(points, normals)
 
         #return  psr_grid,points,rebuild_points,min_depoint,max_depoint
-        return  psr_grid,rebuild_points
+        return  psr_grid, rebuild_points
 
